@@ -52,15 +52,18 @@ async def fetch_channel_messages(
         )
     )
     messages = payload.get("messages", payload if isinstance(payload, list) else [])
-    return [
-        {
-            "user": m.get("user") or m.get("username", "unknown"),
-            "text": m.get("text", ""),
-            "ts": m.get("ts", ""),
-        }
-        for m in messages
-        if m.get("text")
-    ]
+    result = []
+    for m in messages:
+        if isinstance(m, str):
+            if m.strip():
+                result.append({"user": "unknown", "text": m, "ts": ""})
+        elif isinstance(m, dict) and m.get("text"):
+            result.append({
+                "user": m.get("user") or m.get("username", "unknown"),
+                "text": m.get("text", ""),
+                "ts": m.get("ts", ""),
+            })
+    return result
 
 
 @workflows.activity()

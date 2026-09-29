@@ -11,7 +11,7 @@ COPY pyproject.toml uv.lock ./
 # Install dependencies (no dev deps, use frozen lockfile)
 RUN uv sync --frozen --no-dev
 
-# Copy source code (bust cache: 2026-09-29b)
+# Copy source code (bust cache: 2026-09-29c)
 COPY src/ ./src/
 COPY worker.py ./
 
