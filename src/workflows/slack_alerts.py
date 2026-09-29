@@ -46,7 +46,7 @@ async def fetch_channel_messages(
     """Fetch the most recent messages from #eng-alerts-apps."""
     payload = _unwrap(
         await slack.call_tool(
-            tool_name="read_channel",
+            tool_name="slack_read_channel",
             arguments={"channel_name": CHANNEL, "limit": limit},
         )
     )
