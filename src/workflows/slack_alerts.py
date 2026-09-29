@@ -17,6 +17,7 @@ from pydantic import BaseModel
 slack_connector = connector("slack")
 
 CHANNEL = "eng-alerts-apps"
+CHANNEL_ID = "C0BRAB3A7LH"
 MESSAGE_LIMIT = 50
 
 
@@ -44,10 +45,29 @@ async def fetch_channel_messages(
     slack: ToolCallClient = Depends(slack_connector),
 ) -> list[dict]:
     """Fetch the most recent messages from #eng-alerts-apps."""
+    # First resolve the channel name to an ID
+    search_payload = _unwrap(
+        await slack.call_tool(
+            tool_name="slack_search_channels",
+            arguments={"query": CHANNEL, "limit": 5},
+        )
+    )
+    channels = search_payload.get("channels", [])
+    channel_id = None
+    for ch in channels:
+        if ch.get("name") == CHANNEL:
+            channel_id = ch.get("id")
+            break
+    if not channel_id and channels:
+        channel_id = channels[0].get("id")
+    if not channel_id:
+        raise RuntimeError(f"Could not find channel #{CHANNEL}")
+
+    # Now read messages using the channel ID
     payload = _unwrap(
         await slack.call_tool(
             tool_name="slack_read_channel",
-            arguments={"channel_name": CHANNEL, "limit": limit},
+            arguments={"channel_id": channel_id, "limit": limit},
         )
     )
     messages = payload.get("messages", payload if isinstance(payload, list) else [])
