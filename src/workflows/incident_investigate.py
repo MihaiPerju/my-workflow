@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+import asyncio
+
 import mistralai.workflows as workflows
 import mistralai.workflows.plugins.mistralai as workflows_mistralai
 from mistralai.workflows import Depends
@@ -209,7 +211,7 @@ async def send_dm_report(
 class IncidentInvestigateWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: IncidentInput) -> str:
-        slack_messages, grafana_alerts, loki_logs = await workflows.gather(
+        slack_messages, grafana_alerts, loki_logs = await asyncio.gather(
             fetch_slack_alerts(),
             fetch_grafana_alerts(),
             fetch_loki_logs(
