@@ -103,7 +103,6 @@ Provide a short, actionable summary."""
     name="slack-alert-summary",
     workflow_display_name="Slack Alert Summary",
     workflow_description=f"Reads recent messages from #{CHANNEL} and summarizes firing alerts.",
-    on_behalf_of=True,
 )
 @uses_connectors(slack_connector)
 class SlackAlertSummaryWorkflow:
