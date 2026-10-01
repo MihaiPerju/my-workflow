@@ -17,9 +17,11 @@ import os
 import re
 import time
 import urllib.parse
+from datetime import UTC
 
-import mistralai.workflows as workflows
 import mistralai.workflows.plugins.mistralai as workflows_mistralai
+from dotenv import load_dotenv
+from mistralai import workflows
 from mistralai.workflows import Depends
 from mistralai.workflows.plugins.mistralai.connectors import (
     ToolCallClient,
@@ -27,8 +29,6 @@ from mistralai.workflows.plugins.mistralai.connectors import (
     uses_connectors,
 )
 from pydantic import BaseModel
-
-from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -52,9 +52,12 @@ def _grafana_headers() -> dict[str, str]:
 
 async def _find_prometheus_uid() -> str | None:
     import httpx
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{GRAFANA_URL}/api/datasources", headers=_grafana_headers())
+            resp = await client.get(
+                f"{GRAFANA_URL}/api/datasources", headers=_grafana_headers()
+            )
             resp.raise_for_status()
             for ds in resp.json():
                 if ds.get("type") in ("prometheus", "victoriametrics-datasource"):
@@ -82,7 +85,11 @@ def _unwrap_text(response: object) -> str:
     if not content:
         return ""
     first = content[0]
-    return first.get("text") if isinstance(first, dict) else getattr(first, "text", "") or ""
+    return (
+        first.get("text")
+        if isinstance(first, dict)
+        else getattr(first, "text", "") or ""
+    )
 
 
 def _extract_llm_text(response: object) -> str:
@@ -96,8 +103,8 @@ def _extract_llm_text(response: object) -> str:
 
 
 class IncidentInput(BaseModel):
-    message_link: str = ""   # Required when deployed; unused locally
-    alert_text: str = ""     # Pass directly when running locally
+    message_link: str = ""  # Required when deployed; unused locally
+    alert_text: str = ""  # Pass directly when running locally
 
 
 @workflows.activity()
@@ -109,7 +116,12 @@ async def fetch_alert_message(
     channel_id, ts = _parse_slack_link(message_link)
     response = await slack.call_tool(
         tool_name="slack_read_channel",
-        arguments={"channel_id": channel_id, "limit": 10, "oldest": str(ts - 5), "latest": str(ts + 60)},
+        arguments={
+            "channel_id": channel_id,
+            "limit": 10,
+            "oldest": str(ts - 5),
+            "latest": str(ts + 60),
+        },
     )
     return _unwrap_text(response)
 
@@ -168,7 +180,11 @@ async def discover_metrics(service_name: str) -> dict:
 
     prom_uid = await _find_prometheus_uid()
     if not prom_uid:
-        return {"error": "Prometheus datasource not found", "metric_names": [], "label_names": []}
+        return {
+            "error": "Prometheus datasource not found",
+            "metric_names": [],
+            "label_names": [],
+        }
 
     base = f"{GRAFANA_URL}/api/datasources/proxy/uid/{prom_uid}/api/v1"
     headers = _grafana_headers()
@@ -201,30 +217,45 @@ async def discover_metrics(service_name: str) -> dict:
     except Exception as e:
         label_names = [f"error: {e}"]
 
-    return {"service": service_name, "prom_uid": prom_uid or "", "metric_names": metric_names, "label_names": label_names}
+    return {
+        "service": service_name,
+        "prom_uid": prom_uid or "",
+        "metric_names": metric_names,
+        "label_names": label_names,
+    }
 
 
-def _loki_explore_url(loki_uid: str, expr: str, alert_ts: float, now_ts: float, time_range: str = "now-1h") -> str:
+def _loki_explore_url(
+    loki_uid: str, expr: str, alert_ts: float, now_ts: float, time_range: str = "now-1h"
+) -> str:
     duration_s = _time_range_to_seconds(time_range)
     from_ms = int((alert_ts - duration_s) * 1000)
     to_ms = int(min(alert_ts + 900, now_ts) * 1000)
-    payload = json.dumps({
-        "datasource": loki_uid,
-        "queries": [{"refId": "A", "expr": expr}],
-        "range": {"from": str(from_ms), "to": str(to_ms)},
-    }, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "datasource": loki_uid,
+            "queries": [{"refId": "A", "expr": expr}],
+            "range": {"from": str(from_ms), "to": str(to_ms)},
+        },
+        separators=(",", ":"),
+    )
     return f"{GRAFANA_URL}/explore?orgId=1&left={urllib.parse.quote(payload)}"
 
 
-def _grafana_explore_url(prom_uid: str, expr: str, alert_ts: float, now_ts: float, time_range: str = "now-1h") -> str:
+def _grafana_explore_url(
+    prom_uid: str, expr: str, alert_ts: float, now_ts: float, time_range: str = "now-1h"
+) -> str:
     duration_s = _time_range_to_seconds(time_range)
     from_ms = int((alert_ts - duration_s) * 1000)
     to_ms = int(min(alert_ts + 900, now_ts) * 1000)
-    payload = json.dumps({
-        "datasource": prom_uid,
-        "queries": [{"refId": "A", "expr": expr, "instant": False, "range": True}],
-        "range": {"from": str(from_ms), "to": str(to_ms)},
-    }, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "datasource": prom_uid,
+            "queries": [{"refId": "A", "expr": expr, "instant": False, "range": True}],
+            "range": {"from": str(from_ms), "to": str(to_ms)},
+        },
+        separators=(",", ":"),
+    )
     return f"{GRAFANA_URL}/explore?orgId=1&left={urllib.parse.quote(payload)}"
 
 
@@ -291,17 +322,20 @@ def _extract_alert_time(alert_text: str, now_ts: float) -> float:
     # ISO-ish datetime
     m = re.search(r"(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?)", alert_text)
     if m:
-        from datetime import datetime, timezone
+        from datetime import datetime
+
         try:
             dt = datetime.fromisoformat(m.group(1).replace(" ", "T"))
-            return dt.replace(tzinfo=timezone.utc).timestamp()
+            return dt.replace(tzinfo=UTC).timestamp()
         except ValueError:
             pass
     return now_ts
 
 
 @workflows.activity()
-async def execute_and_summarise_query(query: dict, prom_uid: str, alert_ts: float) -> dict:
+async def execute_and_summarise_query(
+    query: dict, prom_uid: str, alert_ts: float
+) -> dict:
     """Run one PromQL query against Prometheus and summarise the result with LLM."""
     import httpx
 
@@ -323,7 +357,12 @@ async def execute_and_summarise_query(query: dict, prom_uid: str, alert_ts: floa
             resp = await client.get(
                 f"{base}/query_range",
                 headers=headers,
-                params={"query": expr, "start": str(int(start)), "end": str(int(end)), "step": str(step)},
+                params={
+                    "query": expr,
+                    "start": str(int(start)),
+                    "end": str(int(end)),
+                    "step": str(step),
+                },
             )
             if resp.status_code == 200:
                 prom_result = resp.json().get("data", {})
@@ -386,7 +425,11 @@ async def generate_loki_queries(
             if resp.status_code == 200:
                 all_ns: list[str] = resp.json().get("data", [])
                 slug = service_name.replace("-", "")
-                namespace_values = [ns for ns in all_ns if slug in ns.replace("-", "") or service_name.split("-")[0] in ns]
+                namespace_values = [
+                    ns
+                    for ns in all_ns
+                    if slug in ns.replace("-", "") or service_name.split("-")[0] in ns
+                ]
                 if not namespace_values:
                     namespace_values = all_ns[:20]
     except Exception:
@@ -423,7 +466,9 @@ Return ONLY a JSON array, no markdown fences or commentary.
 
 
 @workflows.activity()
-async def execute_and_summarise_log_query(query: dict, loki_uid: str, alert_ts: float) -> dict:
+async def execute_and_summarise_log_query(
+    query: dict, loki_uid: str, alert_ts: float
+) -> dict:
     """Run one LogQL query against Loki and summarise the result with LLM."""
     import httpx
 
@@ -443,7 +488,13 @@ async def execute_and_summarise_log_query(query: dict, loki_uid: str, alert_ts: 
             resp = await client.get(
                 f"{base}/query_range",
                 headers=headers,
-                params={"query": expr, "start": str(start), "end": str(end), "limit": 100, "direction": "backward"},
+                params={
+                    "query": expr,
+                    "start": str(start),
+                    "end": str(end),
+                    "limit": 100,
+                    "direction": "backward",
+                },
             )
             if resp.status_code == 200:
                 for stream in resp.json().get("data", {}).get("result", []):
@@ -479,50 +530,122 @@ Logs ({len(log_lines)} lines):
     return {**query, "result_summary": _extract_llm_text(response).strip()}
 
 
+def _parse_datasources(raw: str) -> tuple[str, str]:
+    """Return (prom_uid, loki_uid) from a Grafana list_datasources response.
+
+    Handles:
+    - JSON array of datasource objects
+    - JSON object with a "datasources" or "data" key wrapping the array
+    - Newline-separated text with uid/type fields
+    """
+    prom_uid = ""
+    loki_uid = ""
+
+    if not raw:
+        return prom_uid, loki_uid
+
+    # Try JSON
+    try:
+        parsed = json.loads(raw)
+        # Could be a list directly or wrapped in a key
+        if isinstance(parsed, list):
+            items = parsed
+        elif isinstance(parsed, dict):
+            items = parsed.get("datasources") or parsed.get("data") or []
+            # Some implementations return a single datasource object
+            if not items and "uid" in parsed:
+                items = [parsed]
+        else:
+            items = []
+
+        for ds in items:
+            if not isinstance(ds, dict):
+                continue
+            t = ds.get("type", "")
+            uid = ds.get("uid", "") or ds.get("UID", "")
+            if t in ("prometheus", "victoriametrics-datasource") and not prom_uid:
+                prom_uid = uid
+            if t == "loki" and not loki_uid:
+                loki_uid = uid
+        return prom_uid, loki_uid
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fallback: text parsing — look for uid/type pairs
+    # e.g. "uid: abc123\ntype: prometheus"
+    current: dict[str, str] = {}
+    for line in raw.splitlines():
+        line = line.strip().lstrip("- ")
+        if ":" in line:
+            k, _, v = line.partition(":")
+            current[k.strip().lower()] = v.strip().strip('"')
+        if not line and current:
+            t = current.get("type", "")
+            uid = current.get("uid", "")
+            if t in ("prometheus", "victoriametrics-datasource") and not prom_uid:
+                prom_uid = uid
+            if t == "loki" and not loki_uid:
+                loki_uid = uid
+            current = {}
+    # flush last entry
+    t = current.get("type", "")
+    uid = current.get("uid", "")
+    if t in ("prometheus", "victoriametrics-datasource") and not prom_uid:
+        prom_uid = uid
+    if t == "loki" and not loki_uid:
+        loki_uid = uid
+
+    return prom_uid, loki_uid
+
+
 @workflows.activity()
 async def discover_metrics_via_connector(
     service_name: str,
     grafana: ToolCallClient = Depends(grafana_connector),
 ) -> dict:
     """Discover Prometheus metrics and labels using the Grafana connector."""
-    # Find Prometheus datasource
     ds_resp = await grafana.call_tool("list_datasources", {})
-    prom_uid = ""
-    for ds in (_unwrap_text(ds_resp) and [] or getattr(ds_resp, "content", [ds_resp])):
-        pass  # parse below
     raw = _unwrap_text(ds_resp)
-    try:
-        datasources = json.loads(raw) if isinstance(raw, str) else raw
-        loki_uid_discovered = ""
-        if isinstance(datasources, list):
-            for ds in datasources:
-                if isinstance(ds, dict):
-                    if ds.get("type") in ("prometheus", "victoriametrics-datasource") and not prom_uid:
-                        prom_uid = ds.get("uid", "")
-                    if ds.get("type") == "loki" and not loki_uid_discovered:
-                        loki_uid_discovered = ds.get("uid", "")
-    except Exception:
-        pass
+    prom_uid, loki_uid_discovered = _parse_datasources(raw)
 
     if not prom_uid:
-        return {"service": service_name, "prom_uid": "", "metric_names": [], "label_names": []}
+        return {
+            "service": service_name,
+            "prom_uid": "",
+            "loki_uid": loki_uid_discovered,
+            "metric_names": [],
+            "label_names": [],
+            "_raw_datasources": raw[:500],
+        }
 
     metric_names: list[str] = []
     label_names: list[str] = []
     try:
-        mn_resp = await grafana.call_tool("list_metrics", {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'})
+        mn_resp = await grafana.call_tool(
+            "list_metrics",
+            {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'},
+        )
         mn_raw = _unwrap_text(mn_resp)
         metric_names = json.loads(mn_raw) if mn_raw else []
     except Exception:
         pass
     try:
-        ln_resp = await grafana.call_tool("list_labels", {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'})
+        ln_resp = await grafana.call_tool(
+            "list_labels",
+            {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'},
+        )
         ln_raw = _unwrap_text(ln_resp)
         label_names = json.loads(ln_raw) if ln_raw else []
     except Exception:
         pass
 
-    return {"service": service_name, "prom_uid": prom_uid, "loki_uid": loki_uid_discovered, "metric_names": metric_names, "label_names": label_names}
+    return {
+        "service": service_name,
+        "prom_uid": prom_uid,
+        "loki_uid": loki_uid_discovered,
+        "metric_names": metric_names,
+        "label_names": label_names,
+    }
 
 
 @workflows.activity()
@@ -534,7 +657,7 @@ async def execute_and_summarise_query_via_connector(
     grafana: ToolCallClient = Depends(grafana_connector),
 ) -> dict:
     """Execute a PromQL query via the Grafana connector and summarise with LLM."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     expr = query.get("expr", "")
     time_range = query.get("time_range", "now-1h")
@@ -544,18 +667,23 @@ async def execute_and_summarise_query_via_connector(
     step = max(15, duration_s // 100)
 
     def _ts_to_rfc3339(ts: float) -> str:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.fromtimestamp(ts, tz=UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
     has_data = False
     result_str = ""
     try:
-        resp = await grafana.call_tool("query_metrics_range", {
-            "datasource_uid": prom_uid,
-            "expr": expr,
-            "start_rfc3339": _ts_to_rfc3339(start_ts),
-            "end_rfc3339": _ts_to_rfc3339(end_ts),
-            "step_seconds": step,
-        })
+        resp = await grafana.call_tool(
+            "query_metrics_range",
+            {
+                "datasource_uid": prom_uid,
+                "expr": expr,
+                "start_rfc3339": _ts_to_rfc3339(start_ts),
+                "end_rfc3339": _ts_to_rfc3339(end_ts),
+                "step_seconds": step,
+            },
+        )
         raw = _unwrap_text(resp)
         data = json.loads(raw) if raw else {}
         result = data.get("result", data.get("data", {}).get("result", []))
@@ -594,7 +722,7 @@ async def execute_and_summarise_log_query_via_connector(
     grafana: ToolCallClient = Depends(grafana_connector),
 ) -> dict:
     """Execute a LogQL query via the Grafana connector and summarise with LLM."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     expr = query.get("expr", "")
     time_range = query.get("time_range", "now-1h")
@@ -603,18 +731,23 @@ async def execute_and_summarise_log_query_via_connector(
     end_ts = min(alert_ts + 900, now_ts)
 
     def _ts_to_rfc3339(ts: float) -> str:
-        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.fromtimestamp(ts, tz=UTC).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
     log_lines: list[str] = []
     try:
-        resp = await grafana.call_tool("query_logs_range", {
-            "datasource_uid": loki_uid,
-            "query": expr,
-            "start_rfc3339": _ts_to_rfc3339(start_ts),
-            "end_rfc3339": _ts_to_rfc3339(end_ts),
-            "limit": 100,
-            "direction": "backward",
-        })
+        resp = await grafana.call_tool(
+            "query_logs_range",
+            {
+                "datasource_uid": loki_uid,
+                "query": expr,
+                "start_rfc3339": _ts_to_rfc3339(start_ts),
+                "end_rfc3339": _ts_to_rfc3339(end_ts),
+                "limit": 100,
+                "direction": "backward",
+            },
+        )
         raw = _unwrap_text(resp)
         data = json.loads(raw) if raw else {}
         for stream in data.get("result", data.get("data", {}).get("result", [])):
@@ -663,7 +796,11 @@ class IncidentInvestigateWorkflow:
 
         summary = await summarise_alert(alert_message)
         service_name = await extract_service_name(alert_message)
-        metrics = await (discover_metrics_via_connector(service_name) if use_slack else discover_metrics(service_name))
+        metrics = await (
+            discover_metrics_via_connector(service_name)
+            if use_slack
+            else discover_metrics(service_name)
+        )
 
         prom_uid = metrics.get("prom_uid", "")
         loki_uid = metrics.get("loki_uid", "") if use_slack else LOKI_DATASOURCE_UID
@@ -680,7 +817,11 @@ class IncidentInvestigateWorkflow:
         if loki_uid:
             promql_raw, logql_raw = await asyncio.gather(
                 promql_coro,
-                generate_loki_queries(alert_text=alert_message, service_name=service_name, loki_uid=loki_uid),
+                generate_loki_queries(
+                    alert_text=alert_message,
+                    service_name=service_name,
+                    loki_uid=loki_uid,
+                ),
             )
         else:
             promql_raw = await promql_coro
@@ -692,7 +833,11 @@ class IncidentInvestigateWorkflow:
                 "explanation": q.get("explanation", ""),
                 "expr": q.get("expr", ""),
                 "time_range": q.get("time_range", "now-1h"),
-                "grafana_url": _grafana_explore_url(prom_uid, q["expr"], alert_ts, now_ts, q.get("time_range", "now-1h")) if prom_uid else "",
+                "grafana_url": _grafana_explore_url(
+                    prom_uid, q["expr"], alert_ts, now_ts, q.get("time_range", "now-1h")
+                )
+                if prom_uid
+                else "",
             }
             for q in promql_raw
         ]
@@ -702,30 +847,48 @@ class IncidentInvestigateWorkflow:
                 "explanation": q.get("explanation", ""),
                 "expr": q.get("expr", ""),
                 "time_range": q.get("time_range", "now-1h"),
-                "grafana_url": _loki_explore_url(loki_uid, q["expr"], alert_ts, now_ts, q.get("time_range", "now-1h")) if loki_uid else "",
+                "grafana_url": _loki_explore_url(
+                    loki_uid, q["expr"], alert_ts, now_ts, q.get("time_range", "now-1h")
+                )
+                if loki_uid
+                else "",
             }
             for q in logql_raw
         ]
 
         # Execute and summarise all queries in parallel
         if use_slack and prom_uid:
-            prom_tasks = [execute_and_summarise_query_via_connector(q, prom_uid, alert_ts, now_ts) for q in promql_with_links]
+            prom_tasks = [
+                execute_and_summarise_query_via_connector(q, prom_uid, alert_ts, now_ts)
+                for q in promql_with_links
+            ]
         elif prom_uid:
-            prom_tasks = [execute_and_summarise_query(q, prom_uid, alert_ts) for q in promql_with_links]
+            prom_tasks = [
+                execute_and_summarise_query(q, prom_uid, alert_ts)
+                for q in promql_with_links
+            ]
         else:
             prom_tasks = []
 
         if use_slack and loki_uid:
-            loki_tasks = [execute_and_summarise_log_query_via_connector(q, loki_uid, alert_ts, now_ts) for q in logql_with_links]
+            loki_tasks = [
+                execute_and_summarise_log_query_via_connector(
+                    q, loki_uid, alert_ts, now_ts
+                )
+                for q in logql_with_links
+            ]
         elif loki_uid:
-            loki_tasks = [execute_and_summarise_log_query(q, loki_uid, alert_ts) for q in logql_with_links]
+            loki_tasks = [
+                execute_and_summarise_log_query(q, loki_uid, alert_ts)
+                for q in logql_with_links
+            ]
         else:
             loki_tasks = []
         all_tasks = prom_tasks + loki_tasks
         if all_tasks:
             results = list(await asyncio.gather(*all_tasks))
-            queries = results[:len(prom_tasks)] if prom_tasks else promql_with_links
-            log_queries = results[len(prom_tasks):] if loki_tasks else logql_with_links
+            queries = results[: len(prom_tasks)] if prom_tasks else promql_with_links
+            log_queries = results[len(prom_tasks) :] if loki_tasks else logql_with_links
         else:
             queries = promql_with_links
             log_queries = logql_with_links
@@ -757,10 +920,13 @@ class IncidentInvestigateWorkflow:
                 log_lines.append(f"*{q['title']}*{link}\n{finding}")
             await send_dm("\n".join(log_lines))
 
-        return json.dumps({
-            "summary": summary,
-            "service": service_name,
-            "metrics": metrics,
-            "queries": queries,
-            "log_queries": log_queries,
-        }, indent=2)
+        return json.dumps(
+            {
+                "summary": summary,
+                "service": service_name,
+                "metrics": metrics,
+                "queries": queries,
+                "log_queries": log_queries,
+            },
+            indent=2,
+        )
