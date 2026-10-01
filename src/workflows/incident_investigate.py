@@ -203,10 +203,10 @@ async def discover_metrics(service_name: str) -> dict:
     return {"service": service_name, "prom_uid": prom_uid or "", "metric_names": metric_names, "label_names": label_names}
 
 
-def _loki_explore_url(loki_uid: str, expr: str, alert_ts: float, time_range: str = "now-1h") -> str:
+def _loki_explore_url(loki_uid: str, expr: str, alert_ts: float, now_ts: float, time_range: str = "now-1h") -> str:
     duration_s = _time_range_to_seconds(time_range)
     from_ms = int((alert_ts - duration_s) * 1000)
-    to_ms = int(min(alert_ts + 900, time.time()) * 1000)
+    to_ms = int(min(alert_ts + 900, now_ts) * 1000)
     payload = json.dumps({
         "datasource": loki_uid,
         "queries": [{"refId": "A", "expr": expr}],
@@ -215,10 +215,10 @@ def _loki_explore_url(loki_uid: str, expr: str, alert_ts: float, time_range: str
     return f"{GRAFANA_URL}/explore?orgId=1&left={urllib.parse.quote(payload)}"
 
 
-def _grafana_explore_url(prom_uid: str, expr: str, alert_ts: float, time_range: str = "now-1h") -> str:
+def _grafana_explore_url(prom_uid: str, expr: str, alert_ts: float, now_ts: float, time_range: str = "now-1h") -> str:
     duration_s = _time_range_to_seconds(time_range)
     from_ms = int((alert_ts - duration_s) * 1000)
-    to_ms = int((min(alert_ts + 900, time.time())) * 1000)
+    to_ms = int(min(alert_ts + 900, now_ts) * 1000)
     payload = json.dumps({
         "datasource": prom_uid,
         "queries": [{"refId": "A", "expr": expr, "instant": False, "range": True}],
@@ -276,7 +276,12 @@ def _time_range_to_seconds(time_range: str) -> int:
     return val * {"m": 60, "h": 3600, "d": 86400}[unit]
 
 
-def _extract_alert_time(alert_text: str) -> float:
+@workflows.activity()
+async def get_current_time() -> float:
+    return time.time()
+
+
+def _extract_alert_time(alert_text: str, now_ts: float) -> float:
     """Best-effort: parse a Unix/ISO timestamp from the alert text; fall back to now."""
     # Unix timestamp embedded (e.g. Slack p-link style)
     m = re.search(r"\b(17\d{8})\b", alert_text)
@@ -291,7 +296,7 @@ def _extract_alert_time(alert_text: str) -> float:
             return dt.replace(tzinfo=timezone.utc).timestamp()
         except ValueError:
             pass
-    return time.time()
+    return now_ts
 
 
 @workflows.activity()
@@ -494,7 +499,8 @@ class IncidentInvestigateWorkflow:
 
         prom_uid = metrics.get("prom_uid", "")
         loki_uid = LOKI_DATASOURCE_UID
-        alert_ts = _extract_alert_time(alert_message)
+        now_ts = await get_current_time()
+        alert_ts = _extract_alert_time(alert_message, now_ts)
 
         # Generate PromQL and LogQL query lists in parallel
         promql_coro = generate_promql_queries(
@@ -518,7 +524,7 @@ class IncidentInvestigateWorkflow:
                 "explanation": q.get("explanation", ""),
                 "expr": q.get("expr", ""),
                 "time_range": q.get("time_range", "now-1h"),
-                "grafana_url": _grafana_explore_url(prom_uid, q["expr"], alert_ts, q.get("time_range", "now-1h")) if prom_uid else "",
+                "grafana_url": _grafana_explore_url(prom_uid, q["expr"], alert_ts, now_ts, q.get("time_range", "now-1h")) if prom_uid else "",
             }
             for q in promql_raw
         ]
@@ -528,7 +534,7 @@ class IncidentInvestigateWorkflow:
                 "explanation": q.get("explanation", ""),
                 "expr": q.get("expr", ""),
                 "time_range": q.get("time_range", "now-1h"),
-                "grafana_url": _loki_explore_url(loki_uid, q["expr"], alert_ts, q.get("time_range", "now-1h")) if loki_uid else "",
+                "grafana_url": _loki_explore_url(loki_uid, q["expr"], alert_ts, now_ts, q.get("time_range", "now-1h")) if loki_uid else "",
             }
             for q in logql_raw
         ]
