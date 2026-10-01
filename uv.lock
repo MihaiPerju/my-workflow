@@ -957,6 +957,7 @@ name = "my-workflow"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mistralai-workflows", extra = ["mistralai"] },
     { name = "pydantic" },
     { name = "python-dotenv" },
@@ -973,6 +974,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx" },
     { name = "mistralai-workflows", extras = ["mistralai"], specifier = ">=3.0.0,<4" },
     { name = "pydantic" },
     { name = "python-dotenv" },
