@@ -552,29 +552,31 @@ class IncidentInvestigateWorkflow:
             log_queries = logql_with_links
 
         if not IS_LOCAL:
-            lines = [f"*Incident: {service_name}*\n"]
-
-            lines.append("*Summary*")
+            # --- chunk 1: header + summary ---
+            summary_lines = [f"*Incident: {service_name}*\n", "*Summary*"]
             for b in summary.split("\n"):
                 b = b.strip().lstrip("•- ")
                 if b:
-                    lines.append(f"• {b}")
+                    summary_lines.append(f"• {b}")
+            await send_dm("\n".join(summary_lines))
 
-            lines.append("\n*Metrics*")
+            # --- chunk 2: metrics ---
+            metric_lines = ["*Metrics*"]
             for q in queries:
                 finding = q.get("result_summary", "No data.")
                 url = q.get("grafana_url", "")
                 link = f" (<{url}|graph>)" if url else ""
-                lines.append(f"*{q['title']}*{link}\n{finding}")
+                metric_lines.append(f"*{q['title']}*{link}\n{finding}")
+            await send_dm("\n".join(metric_lines))
 
-            lines.append("\n*Logs*")
+            # --- chunk 3: logs ---
+            log_lines = ["*Logs*"]
             for q in log_queries:
                 finding = q.get("result_summary", "No data.")
                 url = q.get("grafana_url", "")
                 link = f" (<{url}|logs>)" if url else ""
-                lines.append(f"*{q['title']}*{link}\n{finding}")
-
-            await send_dm("\n".join(lines))
+                log_lines.append(f"*{q['title']}*{link}\n{finding}")
+            await send_dm("\n".join(log_lines))
 
         return json.dumps({
             "summary": summary,
