@@ -314,11 +314,31 @@ Return ONLY a JSON array, no markdown fences or commentary.
         messages=[workflows_mistralai.UserMessage(content=prompt)],
     )
     response = await workflows_mistralai.mistralai_chat_complete(request)
-    text = _extract_llm_text(response).strip()
+    return _parse_json_array(_extract_llm_text(response))
+
+
+def _parse_json_array(text: str) -> list[dict]:
+    """Extract a JSON array from LLM output, tolerating preambles and fences."""
+    text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-z]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text.rstrip())
-    return json.loads(text)
+    try:
+        result = json.loads(text)
+        if isinstance(result, list):
+            return result
+    except json.JSONDecodeError:
+        pass
+    # Try to pull out the first [...] block (handles "Sure, here are: [...]")
+    m = re.search(r"\[.*\]", text, re.DOTALL)
+    if m:
+        try:
+            result = json.loads(m.group(0))
+            if isinstance(result, list):
+                return result
+        except json.JSONDecodeError:
+            pass
+    return []
 
 
 def _time_range_to_seconds(time_range: str) -> int:
@@ -484,11 +504,7 @@ Return ONLY a JSON array, no markdown fences or commentary.
         messages=[workflows_mistralai.UserMessage(content=prompt)],
     )
     response = await workflows_mistralai.mistralai_chat_complete(request)
-    text = _extract_llm_text(response).strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-z]*\n?", "", text)
-        text = re.sub(r"\n?```$", "", text.rstrip())
-    return json.loads(text)
+    return _parse_json_array(_extract_llm_text(response))
 
 
 @workflows.activity()
@@ -644,46 +660,12 @@ async def discover_metrics_via_connector(
             "_raw_datasources": raw[:500],
         }
 
-    metric_names: list[str] = []
-    label_names: list[str] = []
-    # Try namespace first (kube deployments use namespace as primary label), then service as fallback
-    for match_filter in [
-        f'{{namespace="{service_name}"}}',
-        f'{{service=~"{service_name}.*"}}',
-    ]:
-        if metric_names:
-            break
-        try:
-            mn_resp = await grafana.call_tool(
-                "list_metrics",
-                {"datasource_uid": prom_uid, "match": match_filter},
-            )
-            mn_raw = _unwrap_text(mn_resp)
-            metric_names = json.loads(mn_raw) if mn_raw else []
-        except Exception:
-            pass
-    for match_filter in [
-        f'{{namespace="{service_name}"}}',
-        f'{{service=~"{service_name}.*"}}',
-    ]:
-        if label_names:
-            break
-        try:
-            ln_resp = await grafana.call_tool(
-                "list_labels",
-                {"datasource_uid": prom_uid, "match": match_filter},
-            )
-            ln_raw = _unwrap_text(ln_resp)
-            label_names = json.loads(ln_raw) if ln_raw else []
-        except Exception:
-            pass
-
     return {
         "service": service_name,
         "prom_uid": prom_uid,
         "loki_uid": loki_uid_discovered,
-        "metric_names": metric_names,
-        "label_names": label_names,
+        "metric_names": [],
+        "label_names": [],
     }
 
 
