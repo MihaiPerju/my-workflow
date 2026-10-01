@@ -276,16 +276,37 @@ Alert:
 {alert_text}
 
 Service slug: {service_name}
-Available Prometheus label names: {labels_str}
+Available Prometheus label names: {labels_str or "(discovery failed — use best-guess labels)"}
 Known metric names for this service: {metrics_str}
 
+## Label and metric conventions for this stack
+
+**Primary filter**: always use `namespace="{service_name}"` (NOT `service="{service_name}"`).
+Also include `cluster="<cluster-from-alert>"` when a cluster is mentioned.
+
+**HTTP metrics** (FastAPI services):
+- `fastapi_responses_total{{namespace="{service_name}", service=~"{service_name}.*", status_code=~"5..", cluster="..."}}` — response counts by status code
+- `fastapi_requests_duration_milliseconds_bucket{{namespace="{service_name}", service=~"{service_name}.*", cluster="..."}}` — latency histogram (use histogram_quantile)
+- Status label is `status_code`, values like `"200"`, `"500"`, use `status_code=~"5.."` for 5xx
+
+**Kubernetes availability**:
+- `kube_deployment_status_replicas_available{{namespace="{service_name}", deployment="{service_name}-app", cluster="..."}}` — available replicas
+- `kube_pod_container_status_restarts_total{{namespace="{service_name}", pod=~"{service_name}-app-.+", cluster="..."}}` — pod restarts
+
+**Container resources**:
+- `container_memory_working_set_bytes{{namespace="{service_name}", pod=~"{service_name}-app-.+", container!="", cluster="..."}}` — memory
+- `container_cpu_usage_seconds_total{{namespace="{service_name}", pod=~"{service_name}-app-.+", container!="", cluster="..."}}` — CPU
+
+**Service-specific custom metrics** (if known metric names include them):
+- Prefer exact metric names from "Known metric names" above when available.
+
 For each query return a JSON object with:
-- "title": short name (e.g. "5xx Error Rate by Handler")
+- "title": short name (e.g. "5xx Error Rate by Endpoint")
 - "explanation": 1-2 sentences on what this shows and why it matters for this incident
-- "expr": valid PromQL expression (use the available labels to filter; prefer `service="{service_name}"` and `cluster` if present)
+- "expr": valid PromQL expression using the conventions above
 - "time_range": one of "now-15m", "now-1h", "now-3h" — pick the window that best surfaces this signal
 
-Cover: error rates, latency percentiles, traffic volume, pod restarts/OOM, upstream dependency health.
+Cover: 5xx error rate, latency percentiles, traffic volume, pod availability, pod restarts, upstream dependency health.
 Return ONLY a JSON array, no markdown fences or commentary.
 """
     request = workflows_mistralai.ChatCompletionRequest(
@@ -441,13 +462,18 @@ Alert:
 {alert_text}
 
 Service: {service_name}
-Available Loki label names: {", ".join(label_names)}
-Likely namespace values: {", ".join(namespace_values)}
+Available Loki label names: {", ".join(label_names) or "(discovery failed — use best-guess labels)"}
+Likely namespace values: {", ".join(namespace_values) or service_name}
+
+## Label conventions for this Loki setup
+
+**Primary stream selector**: `{{namespace="{service_name}", cluster="<cluster-from-alert>"}}` or `{{namespace="{service_name}", container="application", cluster="<cluster-from-alert>"}}`.
+Do NOT use `service=` as the sole selector — always filter by `namespace`.
 
 For each query return a JSON object with:
 - "title": short name (e.g. "Error Logs by Pod")
 - "explanation": 1-2 sentences on what this shows and why it matters for this incident
-- "expr": valid LogQL stream selector + optional line filters (use the available labels; prefer namespace and cluster)
+- "expr": valid LogQL stream selector + optional line filters using the conventions above
 - "time_range": one of "now-15m", "now-1h", "now-3h"
 
 Cover: error/exception lines, 5xx HTTP responses, upstream failures (Koyeb, Secrets API), OOM kills, deployment events.
@@ -620,24 +646,37 @@ async def discover_metrics_via_connector(
 
     metric_names: list[str] = []
     label_names: list[str] = []
-    try:
-        mn_resp = await grafana.call_tool(
-            "list_metrics",
-            {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'},
-        )
-        mn_raw = _unwrap_text(mn_resp)
-        metric_names = json.loads(mn_raw) if mn_raw else []
-    except Exception:
-        pass
-    try:
-        ln_resp = await grafana.call_tool(
-            "list_labels",
-            {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'},
-        )
-        ln_raw = _unwrap_text(ln_resp)
-        label_names = json.loads(ln_raw) if ln_raw else []
-    except Exception:
-        pass
+    # Try namespace first (kube deployments use namespace as primary label), then service as fallback
+    for match_filter in [
+        f'{{namespace="{service_name}"}}',
+        f'{{service=~"{service_name}.*"}}',
+    ]:
+        if metric_names:
+            break
+        try:
+            mn_resp = await grafana.call_tool(
+                "list_metrics",
+                {"datasource_uid": prom_uid, "match": match_filter},
+            )
+            mn_raw = _unwrap_text(mn_resp)
+            metric_names = json.loads(mn_raw) if mn_raw else []
+        except Exception:
+            pass
+    for match_filter in [
+        f'{{namespace="{service_name}"}}',
+        f'{{service=~"{service_name}.*"}}',
+    ]:
+        if label_names:
+            break
+        try:
+            ln_resp = await grafana.call_tool(
+                "list_labels",
+                {"datasource_uid": prom_uid, "match": match_filter},
+            )
+            ln_raw = _unwrap_text(ln_resp)
+            label_names = json.loads(ln_raw) if ln_raw else []
+        except Exception:
+            pass
 
     return {
         "service": service_name,
@@ -667,9 +706,7 @@ async def execute_and_summarise_query_via_connector(
     step = max(15, duration_s // 100)
 
     def _ts_to_rfc3339(ts: float) -> str:
-        return datetime.fromtimestamp(ts, tz=UTC).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     has_data = False
     result_str = ""
@@ -731,9 +768,7 @@ async def execute_and_summarise_log_query_via_connector(
     end_ts = min(alert_ts + 900, now_ts)
 
     def _ts_to_rfc3339(ts: float) -> str:
-        return datetime.fromtimestamp(ts, tz=UTC).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
+        return datetime.fromtimestamp(ts, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     log_lines: list[str] = []
     try:
@@ -805,7 +840,12 @@ class IncidentInvestigateWorkflow:
         prom_uid = metrics.get("prom_uid", "")
         loki_uid = metrics.get("loki_uid", "") if use_slack else LOKI_DATASOURCE_UID
         now_ts = await get_current_time()
-        alert_ts = _extract_alert_time(alert_message, now_ts)
+        # Prefer the timestamp embedded in the Slack message link (reliable);
+        # fall back to parsing the alert text or now.
+        if use_slack:
+            _, alert_ts = _parse_slack_link(input.message_link)
+        else:
+            alert_ts = _extract_alert_time(alert_message, now_ts)
 
         # Generate PromQL and LogQL query lists in parallel
         promql_coro = generate_promql_queries(
