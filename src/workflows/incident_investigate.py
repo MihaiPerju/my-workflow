@@ -357,10 +357,20 @@ async def get_current_time() -> float:
 
 
 def _extract_cluster(alert_text: str) -> str:
-    """Extract cluster name from alert text (e.g. 'prod-swedencentral-1')."""
+    """Extract cluster name from alert text (e.g. 'prod-swedencentral-1').
+
+    Tries multiple patterns:
+    1. Explicit label: cluster=prod-swedencentral-1
+    2. Cluster naming convention: (prod|staging)-<region>-<num>
+    """
+    # 1. Explicit label assignment (cluster=value or cluster: value, not plain whitespace)
     m = re.search(
-        r'cluster[=\s:]+["\']?([a-z0-9][a-z0-9-]+)["\']?', alert_text, re.IGNORECASE
+        r'cluster\s*[=:]\s*["\']?([a-z0-9][a-z0-9-]+)["\']?', alert_text, re.IGNORECASE
     )
+    if m:
+        return m.group(1)
+    # 2. Cluster name embedded in text (e.g. "errors in prod-swedencentral-1")
+    m = re.search(r'\b((?:prod|staging)-[a-z]+-\d+)\b', alert_text, re.IGNORECASE)
     return m.group(1) if m else ""
 
 
