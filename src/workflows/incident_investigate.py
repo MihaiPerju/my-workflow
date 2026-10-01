@@ -101,7 +101,7 @@ async def send_dm(
     """Send a DM to the on-call engineer."""
     await slack.call_tool(
         tool_name="slack_send_message",
-        arguments={"channel_id": "C0BRAB3A7LH", "message": text},
+        arguments={"channel_id": "C0C5URF1H99", "message": text},
     )
 
 
