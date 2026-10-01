@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 slack_connector = connector("slack")
+grafana_connector = connector("grafana")
 
 MY_SLACK_CHANNEL_ID = "C0C5URF1H99"
 IS_LOCAL = not os.getenv("KUBERNETES_SERVICE_HOST")
@@ -478,13 +479,179 @@ Logs ({len(log_lines)} lines):
     return {**query, "result_summary": _extract_llm_text(response).strip()}
 
 
+@workflows.activity()
+async def discover_metrics_via_connector(
+    service_name: str,
+    grafana: ToolCallClient = Depends(grafana_connector),
+) -> dict:
+    """Discover Prometheus metrics and labels using the Grafana connector."""
+    # Find Prometheus datasource
+    ds_resp = await grafana.call_tool("list_datasources", {})
+    prom_uid = ""
+    for ds in (_unwrap_text(ds_resp) and [] or getattr(ds_resp, "content", [ds_resp])):
+        pass  # parse below
+    raw = _unwrap_text(ds_resp)
+    try:
+        datasources = json.loads(raw) if isinstance(raw, str) else raw
+        loki_uid_discovered = ""
+        if isinstance(datasources, list):
+            for ds in datasources:
+                if isinstance(ds, dict):
+                    if ds.get("type") in ("prometheus", "victoriametrics-datasource") and not prom_uid:
+                        prom_uid = ds.get("uid", "")
+                    if ds.get("type") == "loki" and not loki_uid_discovered:
+                        loki_uid_discovered = ds.get("uid", "")
+    except Exception:
+        pass
+
+    if not prom_uid:
+        return {"service": service_name, "prom_uid": "", "metric_names": [], "label_names": []}
+
+    metric_names: list[str] = []
+    label_names: list[str] = []
+    try:
+        mn_resp = await grafana.call_tool("list_metrics", {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'})
+        mn_raw = _unwrap_text(mn_resp)
+        metric_names = json.loads(mn_raw) if mn_raw else []
+    except Exception:
+        pass
+    try:
+        ln_resp = await grafana.call_tool("list_labels", {"datasource_uid": prom_uid, "match": f'{{service="{service_name}"}}'})
+        ln_raw = _unwrap_text(ln_resp)
+        label_names = json.loads(ln_raw) if ln_raw else []
+    except Exception:
+        pass
+
+    return {"service": service_name, "prom_uid": prom_uid, "loki_uid": loki_uid_discovered, "metric_names": metric_names, "label_names": label_names}
+
+
+@workflows.activity()
+async def execute_and_summarise_query_via_connector(
+    query: dict,
+    prom_uid: str,
+    alert_ts: float,
+    now_ts: float,
+    grafana: ToolCallClient = Depends(grafana_connector),
+) -> dict:
+    """Execute a PromQL query via the Grafana connector and summarise with LLM."""
+    from datetime import datetime, timezone
+
+    expr = query.get("expr", "")
+    time_range = query.get("time_range", "now-1h")
+    duration_s = _time_range_to_seconds(time_range)
+    start_ts = alert_ts - duration_s
+    end_ts = min(alert_ts + 900, now_ts)
+    step = max(15, duration_s // 100)
+
+    def _ts_to_rfc3339(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    has_data = False
+    result_str = ""
+    try:
+        resp = await grafana.call_tool("query_metrics_range", {
+            "datasource_uid": prom_uid,
+            "expr": expr,
+            "start_rfc3339": _ts_to_rfc3339(start_ts),
+            "end_rfc3339": _ts_to_rfc3339(end_ts),
+            "step_seconds": step,
+        })
+        raw = _unwrap_text(resp)
+        data = json.loads(raw) if raw else {}
+        result = data.get("result", data.get("data", {}).get("result", []))
+        has_data = bool(result)
+        result_str = json.dumps(result, separators=(",", ":"))[:4000]
+    except Exception as e:
+        result_str = f"error: {e}"
+
+    if not has_data:
+        return {**query, "result_summary": "No data."}
+
+    prompt = f"""You are an SRE investigating a production incident. You have the Prometheus result below.
+In 1-2 sentences: what was observed, what it points to, and what to investigate next.
+Do not describe the data format. Focus on the signal.
+
+Query: {query.get("title", "")}
+PromQL: {expr}
+
+Result:
+{result_str}
+"""
+    request = workflows_mistralai.ChatCompletionRequest(
+        model="mistral-small-latest",
+        messages=[workflows_mistralai.UserMessage(content=prompt)],
+    )
+    response = await workflows_mistralai.mistralai_chat_complete(request)
+    return {**query, "result_summary": _extract_llm_text(response).strip()}
+
+
+@workflows.activity()
+async def execute_and_summarise_log_query_via_connector(
+    query: dict,
+    loki_uid: str,
+    alert_ts: float,
+    now_ts: float,
+    grafana: ToolCallClient = Depends(grafana_connector),
+) -> dict:
+    """Execute a LogQL query via the Grafana connector and summarise with LLM."""
+    from datetime import datetime, timezone
+
+    expr = query.get("expr", "")
+    time_range = query.get("time_range", "now-1h")
+    duration_s = _time_range_to_seconds(time_range)
+    start_ts = alert_ts - duration_s
+    end_ts = min(alert_ts + 900, now_ts)
+
+    def _ts_to_rfc3339(ts: float) -> str:
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    log_lines: list[str] = []
+    try:
+        resp = await grafana.call_tool("query_logs_range", {
+            "datasource_uid": loki_uid,
+            "query": expr,
+            "start_rfc3339": _ts_to_rfc3339(start_ts),
+            "end_rfc3339": _ts_to_rfc3339(end_ts),
+            "limit": 100,
+            "direction": "backward",
+        })
+        raw = _unwrap_text(resp)
+        data = json.loads(raw) if raw else {}
+        for stream in data.get("result", data.get("data", {}).get("result", [])):
+            for _ts, line in stream.get("values", []):
+                log_lines.append(line)
+    except Exception:
+        pass
+
+    if not log_lines:
+        return {**query, "result_summary": "No data."}
+
+    sample = "\n".join(log_lines[:60])[:4000]
+    prompt = f"""You are an SRE investigating a production incident. You have the log lines below.
+In 1-2 sentences: what was observed, what it points to, and what to investigate next.
+Do not describe the log format. Focus on the signal.
+
+Query: {query.get("title", "")}
+LogQL: {expr}
+
+Logs ({len(log_lines)} lines):
+{sample}
+"""
+    request = workflows_mistralai.ChatCompletionRequest(
+        model="mistral-small-latest",
+        messages=[workflows_mistralai.UserMessage(content=prompt)],
+    )
+    response = await workflows_mistralai.mistralai_chat_complete(request)
+    return {**query, "result_summary": _extract_llm_text(response).strip()}
+
+
 @workflows.workflow.define(
     name="incident-investigate",
     workflow_display_name="Incident Investigation",
     workflow_description="Reads a Slack alert by link, summarises it, and DMs the summary back.",
     on_behalf_of=True,
 )
-@uses_connectors(slack_connector)
+@uses_connectors(slack_connector, grafana_connector)
 class IncidentInvestigateWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: IncidentInput) -> str:
@@ -496,10 +663,10 @@ class IncidentInvestigateWorkflow:
 
         summary = await summarise_alert(alert_message)
         service_name = await extract_service_name(alert_message)
-        metrics = await discover_metrics(service_name)
+        metrics = await (discover_metrics_via_connector(service_name) if use_slack else discover_metrics(service_name))
 
         prom_uid = metrics.get("prom_uid", "")
-        loki_uid = LOKI_DATASOURCE_UID
+        loki_uid = metrics.get("loki_uid", "") if use_slack else LOKI_DATASOURCE_UID
         now_ts = await get_current_time()
         alert_ts = _extract_alert_time(alert_message, now_ts)
 
@@ -541,8 +708,19 @@ class IncidentInvestigateWorkflow:
         ]
 
         # Execute and summarise all queries in parallel
-        prom_tasks = [execute_and_summarise_query(q, prom_uid, alert_ts) for q in promql_with_links] if prom_uid else []
-        loki_tasks = [execute_and_summarise_log_query(q, loki_uid, alert_ts) for q in logql_with_links] if loki_uid else []
+        if use_slack and prom_uid:
+            prom_tasks = [execute_and_summarise_query_via_connector(q, prom_uid, alert_ts, now_ts) for q in promql_with_links]
+        elif prom_uid:
+            prom_tasks = [execute_and_summarise_query(q, prom_uid, alert_ts) for q in promql_with_links]
+        else:
+            prom_tasks = []
+
+        if use_slack and loki_uid:
+            loki_tasks = [execute_and_summarise_log_query_via_connector(q, loki_uid, alert_ts, now_ts) for q in logql_with_links]
+        elif loki_uid:
+            loki_tasks = [execute_and_summarise_log_query(q, loki_uid, alert_ts) for q in logql_with_links]
+        else:
+            loki_tasks = []
         all_tasks = prom_tasks + loki_tasks
         if all_tasks:
             results = list(await asyncio.gather(*all_tasks))
