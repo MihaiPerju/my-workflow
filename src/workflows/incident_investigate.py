@@ -263,12 +263,14 @@ def _grafana_explore_url(
 async def generate_promql_queries(
     alert_text: str,
     service_name: str,
+    cluster: str,
     label_names: list[str],
     metric_names: list[str],
 ) -> list[dict]:
     """Use LLM to produce targeted PromQL queries for investigating the incident."""
     labels_str = ", ".join(label_names[:40])
     metrics_str = ", ".join(metric_names[:50]) if metric_names else "none found"
+    cluster_filter = f'cluster="{cluster}", ' if cluster else ""
 
     prompt = f"""You are an SRE investigating a production incident. Generate 6-8 targeted PromQL queries to investigate this alert.
 
@@ -282,20 +284,20 @@ Known metric names for this service: {metrics_str}
 ## Label and metric conventions for this stack
 
 **Primary filter**: always use `namespace="{service_name}"` (NOT `service="{service_name}"`).
-Also include `cluster="<cluster-from-alert>"` when a cluster is mentioned.
+Also include `{cluster_filter}` in every query.
 
 **HTTP metrics** (FastAPI services):
-- `fastapi_responses_total{{namespace="{service_name}", service=~"{service_name}.*", status_code=~"5..", cluster="..."}}` — response counts by status code
-- `fastapi_requests_duration_milliseconds_bucket{{namespace="{service_name}", service=~"{service_name}.*", cluster="..."}}` — latency histogram (use histogram_quantile)
+- `fastapi_responses_total{{{cluster_filter}namespace="{service_name}", service=~"{service_name}.*", status_code=~"5.."}}` — response counts by status code
+- `fastapi_requests_duration_milliseconds_bucket{{{cluster_filter}namespace="{service_name}", service=~"{service_name}.*"}}` — latency histogram (use histogram_quantile)
 - Status label is `status_code`, values like `"200"`, `"500"`, use `status_code=~"5.."` for 5xx
 
 **Kubernetes availability**:
-- `kube_deployment_status_replicas_available{{namespace="{service_name}", deployment="{service_name}-app", cluster="..."}}` — available replicas
-- `kube_pod_container_status_restarts_total{{namespace="{service_name}", pod=~"{service_name}-app-.+", cluster="..."}}` — pod restarts
+- `kube_deployment_status_replicas_available{{{cluster_filter}namespace="{service_name}", deployment="{service_name}-app"}}` — available replicas
+- `kube_pod_container_status_restarts_total{{{cluster_filter}namespace="{service_name}", pod=~"{service_name}-app-.+"}}` — pod restarts
 
 **Container resources**:
-- `container_memory_working_set_bytes{{namespace="{service_name}", pod=~"{service_name}-app-.+", container!="", cluster="..."}}` — memory
-- `container_cpu_usage_seconds_total{{namespace="{service_name}", pod=~"{service_name}-app-.+", container!="", cluster="..."}}` — CPU
+- `container_memory_working_set_bytes{{{cluster_filter}namespace="{service_name}", pod=~"{service_name}-app-.+", container!=""}}` — memory
+- `container_cpu_usage_seconds_total{{{cluster_filter}namespace="{service_name}", pod=~"{service_name}-app-.+", container!=""}}` — CPU
 
 **Service-specific custom metrics** (if known metric names include them):
 - Prefer exact metric names from "Known metric names" above when available.
@@ -352,6 +354,14 @@ def _time_range_to_seconds(time_range: str) -> int:
 @workflows.activity()
 async def get_current_time() -> float:
     return time.time()
+
+
+def _extract_cluster(alert_text: str) -> str:
+    """Extract cluster name from alert text (e.g. 'prod-swedencentral-1')."""
+    m = re.search(
+        r'cluster[=\s:]+["\']?([a-z0-9][a-z0-9-]+)["\']?', alert_text, re.IGNORECASE
+    )
+    return m.group(1) if m else ""
 
 
 def _extract_alert_time(alert_text: str, now_ts: float) -> float:
@@ -442,6 +452,7 @@ Result:
 async def generate_loki_queries(
     alert_text: str,
     service_name: str,
+    cluster: str,
     loki_uid: str,
 ) -> list[dict]:
     """Discover Loki labels then use LLM to generate targeted LogQL queries."""
@@ -487,7 +498,7 @@ Likely namespace values: {", ".join(namespace_values) or service_name}
 
 ## Label conventions for this Loki setup
 
-**Primary stream selector**: `{{namespace="{service_name}", cluster="<cluster-from-alert>"}}` or `{{namespace="{service_name}", container="application", cluster="<cluster-from-alert>"}}`.
+**Primary stream selector**: `{{namespace="{service_name}", cluster="{cluster}"}}` or `{{namespace="{service_name}", container="application", cluster="{cluster}"}}`.
 Do NOT use `service=` as the sole selector — always filter by `namespace`.
 
 For each query return a JSON object with:
@@ -829,10 +840,13 @@ class IncidentInvestigateWorkflow:
         else:
             alert_ts = _extract_alert_time(alert_message, now_ts)
 
+        cluster = _extract_cluster(alert_message)
+
         # Generate PromQL and LogQL query lists in parallel
         promql_coro = generate_promql_queries(
             alert_text=alert_message,
             service_name=service_name,
+            cluster=cluster,
             label_names=metrics.get("label_names", []),
             metric_names=metrics.get("metric_names", []),
         )
@@ -842,6 +856,7 @@ class IncidentInvestigateWorkflow:
                 generate_loki_queries(
                     alert_text=alert_message,
                     service_name=service_name,
+                    cluster=cluster,
                     loki_uid=loki_uid,
                 ),
             )
