@@ -455,37 +455,8 @@ async def generate_loki_queries(
     cluster: str,
     loki_uid: str,
 ) -> list[dict]:
-    """Discover Loki labels then use LLM to generate targeted LogQL queries."""
-    import httpx
-
-    base = f"{GRAFANA_URL}/api/datasources/proxy/uid/{loki_uid}/loki/api/v1"
-    headers = _grafana_headers()
-
-    label_names: list[str] = []
-    namespace_values: list[str] = []
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{base}/labels", headers=headers)
-            if resp.status_code == 200:
-                label_names = resp.json().get("data", [])
-    except Exception:
-        pass
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{base}/label/namespace/values", headers=headers)
-            if resp.status_code == 200:
-                all_ns: list[str] = resp.json().get("data", [])
-                slug = service_name.replace("-", "")
-                namespace_values = [
-                    ns
-                    for ns in all_ns
-                    if slug in ns.replace("-", "") or service_name.split("-")[0] in ns
-                ]
-                if not namespace_values:
-                    namespace_values = all_ns[:20]
-    except Exception:
-        pass
+    """Use LLM to generate targeted LogQL queries for investigating the incident."""
+    cluster_sel = f', cluster="{cluster}"' if cluster else ""
 
     prompt = f"""You are an SRE investigating a production incident. Generate 4-6 targeted LogQL queries to investigate this alert.
 
@@ -493,21 +464,32 @@ Alert:
 {alert_text}
 
 Service: {service_name}
-Available Loki label names: {", ".join(label_names) or "(discovery failed — use best-guess labels)"}
-Likely namespace values: {", ".join(namespace_values) or service_name}
+Cluster: {cluster or "(unknown)"}
 
-## Label conventions for this Loki setup
+## Label and log conventions for this Loki setup
 
-**Primary stream selector**: `{{namespace="{service_name}", cluster="{cluster}"}}` or `{{namespace="{service_name}", container="application", cluster="{cluster}"}}`.
-Do NOT use `service=` as the sole selector — always filter by `namespace`.
+**Stream selector**: always use `{{namespace="{service_name}"{cluster_sel}}}`.
+Optionally add `container="main"` to narrow to the app container.
+
+**Log format**: logs are JSON objects. Use `| json` to parse them, then filter on fields.
+- HTTP status codes are in the JSON body as `status_code` (e.g. `500`, `"500"`).
+  Filter with `|= "\\"status_code\\":5"` (NOT as a stream label `status_code=~"5.."`).
+- Events are under `event` field.
+- Logger/level under `level` or `detected_level` stream label (values: `error`, `warning`, `info`, `debug`).
+
+**Useful line filter patterns**:
+- 5xx errors: `|= "\\"status_code\\":5"`
+- Errors by level: `{{namespace="{service_name}"{cluster_sel}, detected_level="error"}}`
+- Upstream failures: `|= "Failed"` or `|= "exception"`
+- OOM: `|= "OOM"` or `|= "killed"`
 
 For each query return a JSON object with:
-- "title": short name (e.g. "Error Logs by Pod")
+- "title": short name (e.g. "5xx HTTP Errors")
 - "explanation": 1-2 sentences on what this shows and why it matters for this incident
-- "expr": valid LogQL stream selector + optional line filters using the conventions above
+- "expr": valid LogQL expression using the conventions above
 - "time_range": one of "now-15m", "now-1h", "now-3h"
 
-Cover: error/exception lines, 5xx HTTP responses, upstream failures (Koyeb, Secrets API), OOM kills, deployment events.
+Cover: 5xx HTTP errors (use JSON body filter), error-level logs, upstream/remote failures, pod crashes/OOM.
 Return ONLY a JSON array, no markdown fences or commentary.
 """
     request = workflows_mistralai.ChatCompletionRequest(
@@ -515,7 +497,31 @@ Return ONLY a JSON array, no markdown fences or commentary.
         messages=[workflows_mistralai.UserMessage(content=prompt)],
     )
     response = await workflows_mistralai.mistralai_chat_complete(request)
-    return _parse_json_array(_extract_llm_text(response))
+    raw = _extract_llm_text(response)
+    result = _parse_json_array(raw)
+    if not result:
+        # Fallback: generate minimal hardcoded queries so the log section is never empty
+        result = [
+            {
+                "title": "5xx HTTP Errors",
+                "explanation": "Filters log lines where status_code is 5xx using JSON body match.",
+                "expr": f'{{namespace="{service_name}"{cluster_sel}}} |= "\\"status_code\\":5"',
+                "time_range": "now-1h",
+            },
+            {
+                "title": "Error-Level Logs",
+                "explanation": "Streams with detected_level=error to find exceptions and failures.",
+                "expr": f'{{namespace="{service_name}"{cluster_sel}, detected_level="error"}}',
+                "time_range": "now-1h",
+            },
+            {
+                "title": "Upstream / Remote Failures",
+                "explanation": "Lines containing 'Failed' to catch upstream dependency errors.",
+                "expr": f'{{namespace="{service_name}"{cluster_sel}}} |= "Failed"',
+                "time_range": "now-1h",
+            },
+        ]
+    return result
 
 
 @workflows.activity()
