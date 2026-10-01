@@ -848,8 +848,9 @@ class IncidentInvestigateWorkflow:
 
         cluster = _extract_cluster(alert_message)
 
-        # Generate PromQL and LogQL query lists in parallel
-        promql_coro = generate_promql_queries(
+        # Generate PromQL and LogQL query lists — run sequentially to avoid
+        # asyncio.gather + Temporal activity edge cases
+        promql_raw = await generate_promql_queries(
             alert_text=alert_message,
             service_name=service_name,
             cluster=cluster,
@@ -857,17 +858,16 @@ class IncidentInvestigateWorkflow:
             metric_names=metrics.get("metric_names", []),
         )
         if loki_uid:
-            promql_raw, logql_raw = await asyncio.gather(
-                promql_coro,
-                generate_loki_queries(
+            try:
+                logql_raw = await generate_loki_queries(
                     alert_text=alert_message,
                     service_name=service_name,
                     cluster=cluster,
                     loki_uid=loki_uid,
-                ),
-            )
+                )
+            except Exception:
+                logql_raw = []
         else:
-            promql_raw = await promql_coro
             logql_raw = []
 
         promql_with_links = [
