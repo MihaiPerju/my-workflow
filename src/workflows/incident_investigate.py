@@ -488,10 +488,11 @@ Logs ({len(log_lines)} lines):
 class IncidentInvestigateWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: IncidentInput) -> str:
-        if IS_LOCAL:
-            alert_message = input.alert_text
-        else:
+        use_slack = bool(input.message_link)
+        if use_slack:
             alert_message = await fetch_alert_message(input.message_link)
+        else:
+            alert_message = input.alert_text
 
         summary = await summarise_alert(alert_message)
         service_name = await extract_service_name(alert_message)
@@ -551,7 +552,7 @@ class IncidentInvestigateWorkflow:
             queries = promql_with_links
             log_queries = logql_with_links
 
-        if not IS_LOCAL:
+        if use_slack:
             # --- chunk 1: header + summary ---
             summary_lines = [f"*Incident: {service_name}*\n", "*Summary*"]
             for b in summary.split("\n"):
